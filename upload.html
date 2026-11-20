@@ -1,0 +1,50 @@
+﻿<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Lecture studio · AI Notes</title>
+  <link rel="stylesheet" href="/frontend/studio.css">
+  <script defer src="/frontend/markdown.js"></script>
+  <script defer src="/frontend/studio.js"></script>
+</head>
+<body>
+<header><div class="bar"><a class="brand" href="/"><i class="mark" aria-hidden="true">▥</i> AI Notes</a><span class="divider"></span><span>Study workspace</span></div></header>
+<main>
+  <div class="hero">
+    <div><h1>Lecture studio<span>.</span></h1><p>Turn your lecture recordings into notes you can study.</p></div>
+    <div class="cassette" aria-hidden="true"><div class="tape-label"><span>LECTURE AUDIO</span><b>Ａ</b></div><div class="reels"><i></i><em></em><i></i></div><div class="tape-base"></div></div>
+  </div>
+  <div class="layout">
+    <section class="card setup" aria-labelledby="setup-title">
+      <div class="cardhead"><span class="heading-icon" aria-hidden="true">≋</span><h2 id="setup-title">Recording setup</h2></div>
+      <form id="upload"><fieldset id="fields">
+        <div class="labelrow"><label for="file">Lecture recording</label><span class="language" id="language">English recordings only</span></div>
+        <div class="drop" id="drop"><span class="upload-icon" aria-hidden="true">↑</span><strong id="fileTitle">Choose a recording</strong><span id="fileInfo">or drag and drop your audio file</span><input type="file" name="file" id="file" accept="audio/*,video/*,.aac,.m4a,.opus,.webm" required aria-describedby="language fileInfo"></div>
+        <label for="context">Lecture context <small>Optional</small></label>
+        <textarea id="context" name="context" rows="2" placeholder="Intro to Biology, lecture on cell division"></textarea>
+        <label for="model">Transcription model</label>
+        <select id="model" name="model" aria-describedby="modelHelp"><option value="">Loading models…</option></select>
+        <p class="hint" id="modelHelp">Smaller models run faster. Larger models usually recognize more detail.</p>
+        <button id="modelRetry" class="quiet" type="button" hidden>Reload models</button>
+        <button class="primary" id="submit" disabled><span aria-hidden="true">✦</span> Generate notes</button>
+      </fieldset></form>
+    </section>
+    <section class="card workspace" aria-labelledby="notesTitle">
+      <div class="cardhead"><span class="heading-icon papericon" aria-hidden="true">▤</span><h2 id="notesTitle">Study notes</h2></div>
+      <div id="empty"><div class="sheets" aria-hidden="true"><div class="sheet back"></div><div class="sheet front"><i></i><b></b><b></b><em></em><b></b></div><span>✦</span></div><h3>Your notes will appear here</h3><p>Choose a lecture recording to get started.</p></div>
+      <div id="work" hidden>
+        <strong id="recordName"></strong><small id="elapsed"></small>
+        <p id="status" role="status" tabindex="-1"></p>
+        <div class="progressline" id="meter" aria-hidden="true"><i></i><i></i><i></i></div>
+        <button class="quiet" type="button" id="retry" hidden>Retry status check</button>
+        <button class="quiet" type="button" id="wait" hidden>Pause live updates</button>
+        <button class="quiet" type="button" id="stop" hidden>Stop generation</button>
+        <details id="live" hidden open><summary>Live transcript</summary><p id="transcript"></p></details>
+        <div id="result" hidden><div class="actions"><button type="button" class="quiet" id="copy">Copy Markdown</button><a class="action" id="download" download>Download notes</a></div><small role="status" id="copyState"></small><article id="preview" aria-label="Generated study notes"></article>
+        <button class="quiet" type="button" id="another">Start another recording</button></div>
+      </div>
+    </section>
+  </div>
+</main>
+</body></html>

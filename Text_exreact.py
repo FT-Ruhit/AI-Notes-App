@@ -1,77 +1,135 @@
+import io
 import os
 import sys
+from contextlib import contextmanager, nullcontext
+from collections.abc import Callable
+from functools import cached_property
+from itertools import chain
 from pathlib import Path
+from typing import BinaryIO
 
 import av
 import numpy as np
-from faster_whisper import WhisperModel
 
+from config import WHISPER_DEVICE, WHISPER_LANGUAGE, WHISPER_MODEL
 
+SAMPLE_RATE = 16_000
+S16_TO_FLOAT32 = np.float32(1 / 32768)
+AudioSource = str | Path | BinaryIO
+
+# Keep the handles alive so CTranslate2 can load the pip-installed CUDA DLLs.
 _cuda_dll_handles = []
 if os.name == "nt":
-    _site_packages = Path(sys.prefix) / "Lib" / "site-packages"
-    for _pkg in ("cublas", "cudnn", "cuda_nvrtc"):
-        _bin = _site_packages / "nvidia" / _pkg / "bin"
-        if _bin.is_dir():
-            _cuda_dll_handles.append(os.add_dll_directory(str(_bin)))
-            os.environ["PATH"] = str(_bin) + os.pathsep + os.environ["PATH"]
+    for package in ("cublas", "cudnn", "cuda_nvrtc"):
+        directory = Path(sys.prefix) / "Lib" / "site-packages" / "nvidia" / package / "bin"
+        if directory.is_dir():
+            _cuda_dll_handles.append(os.add_dll_directory(str(directory)))
+            os.environ["PATH"] = str(directory) + os.pathsep + os.environ["PATH"]
 
 
-_av_open = av.open
+class InvalidAudioError(ValueError):
+    pass
 
 
-def _open_media(file, mode = "r", **kwargs):
-    kwargs.pop("metadata_errors", None)
-    return _av_open(file, mode=mode, **kwargs)
+class AudioTooLongError(ValueError):
+    pass
 
 
-av.open = _open_media
+@contextmanager
+def open_recording(source: AudioSource):
+    recording = Path(source).open("rb") if isinstance(source, (str, Path)) else nullcontext(source)
+    # Read only the supplied recording, including when a demuxer encounters an external reference.
+    with recording as file, av.open(file, mode="r", options={"protocol_whitelist": ""}) as container:
+        yield container
+
+
+def _audio_frames(container):
+    if not container.streams.audio:
+        raise InvalidAudioError("The file contains no audio track.")
+    for packet in container.demux(container.streams.audio[0]):
+        try:
+            frames = packet.decode()
+        except av.error.InvalidDataError:
+            # A damaged AAC packet need not discard the rest of the lecture.
+            continue
+        for frame in frames:
+            frame.pts = None
+            yield frame
+
+
+def decode_audio(source: AudioSource, *, max_seconds: int | None = None,
+                 check_stop: Callable[[], None] | None = None) -> np.ndarray:
+    """Decode the first audio track to the mono float32 waveform Whisper expects."""
+    byte_limit = None if max_seconds is None else max_seconds * SAMPLE_RATE * 4
+    pcm = io.BytesIO()
+    # Keep the original 16-bit downmix and normalize one frame at a time.
+    resampler = av.AudioResampler(format="s16", layout="mono", rate=SAMPLE_RATE)
+    try:
+        with open_recording(source) as container:
+            for frame in chain(_audio_frames(container), (None,)):  # None flushes the resampler.
+                if check_stop:
+                    check_stop()
+                for output in resampler.resample(frame):
+                    if byte_limit is not None and pcm.tell() + output.samples * 4 > byte_limit:
+                        raise AudioTooLongError("The recording exceeds the audio duration limit.")
+                    pcm.write(output.to_ndarray() * S16_TO_FLOAT32)
+    except av.FFmpegError as exc:
+        raise InvalidAudioError("The file could not be decoded as audio.") from exc
+    if not pcm.tell():
+        raise InvalidAudioError("The audio track contains no decodable samples.")
+    return np.frombuffer(pcm.getbuffer(), dtype=np.float32)
 
 
 def decode_aac(audio_path: str) -> np.ndarray:
-    resampler = av.AudioResampler(format="s16", layout="mono", rate=16000)
-    chunks = []
-    with av.open(audio_path) as container:
-        for packet in container.demux(audio=0):
-            try:
-                frames = packet.decode()
-            except av.error.InvalidDataError:
-                continue
-            for frame in frames:
-                frame.pts = None
-                for output in resampler.resample(frame):
-                    chunks.append(output.to_ndarray().reshape(-1))
-        for output in resampler.resample(None):
-            chunks.append(output.to_ndarray().reshape(-1))
-    if not chunks:
-        raise ValueError(f"No decodable audio found: {audio_path}")
-    return np.concatenate(chunks).astype(np.float32) / 32768.0
+    return decode_audio(audio_path)
 
 
 class Transcriber:
-    def __init__(self, model_size="small", device="cuda", language="en"):
-        compute_type = "float16" if device == "cuda" else "int8"
+    def __init__(self, model_size="small", device=WHISPER_DEVICE, language=WHISPER_LANGUAGE):
+        self.model_size = model_size
+        self.device = device
         self.language = language
-        self.model = WhisperModel(model_size, device=device, compute_type=compute_type)
 
-    def transcribe(self, audio_path: str) -> str:
-        if not Path(audio_path).is_file():
-            raise FileNotFoundError(f"Audio file not found: {audio_path}")
+    @cached_property
+    def model(self):
+        from ctranslate2 import get_cuda_device_count
+        from faster_whisper import WhisperModel
 
-        audio = decode_aac(audio_path) if Path(audio_path).suffix.lower() == ".aac" else audio_path
-        segments, _info = self.model.transcribe(
-            audio,
+        device = self.device
+        if device == "auto":
+            device = "cuda" if get_cuda_device_count() else "cpu"
+        compute_type = "float16" if device == "cuda" else "int8"
+        return WhisperModel(self.model_size, device=device, compute_type=compute_type)
+
+    def transcribe(self, audio_path: AudioSource, *, max_seconds: int | None = None,
+                   on_segment: Callable[[str], None] | None = None,
+                   check_stop: Callable[[], None] | None = None) -> str:
+        waveform = decode_audio(audio_path, max_seconds=max_seconds, check_stop=check_stop)
+        if check_stop:
+            check_stop()
+        model = self.model
+        if check_stop:
+            check_stop()
+        segments, _ = model.transcribe(
+            waveform,
             language=self.language,
             vad_filter=True,
             condition_on_previous_text=False,
         )
-        return " ".join(seg.text.strip() for seg in segments)
+        texts = []
+        for segment in segments:
+            if check_stop:
+                check_stop()
+            text = segment.text.strip()
+            if text:
+                texts.append(text)
+                if on_segment is not None:
+                    on_segment(text)
+            if check_stop:
+                check_stop()
+        return " ".join(texts)
 
 
 if __name__ == "__main__":
-
-    transcriber = Transcriber(model_size="medium")
-    text = transcriber.transcribe("./Wednesday_HUM.aac")
-    with open("./temp.txt", "w", encoding="utf-8") as f:
-        f.write(text)
-    
+    transcript = Transcriber(WHISPER_MODEL).transcribe("./Wednesday_HUM.aac")
+    Path("temp.txt").write_text(transcript, encoding="utf-8")
