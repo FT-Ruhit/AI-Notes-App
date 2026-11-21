@@ -1,13 +1,15 @@
-test.py
-.vscode/
-.venv/
+# Python
 __pycache__/
+.venv/
+
+# Editors
+.vscode/
+
+# Secrets (see .env.example)
 .env
-*.txt
-*.md
-!README.md
-output/*
-!output/.gitkeep
+
+# Your recordings, transcripts and notes
 input/*
 !input/.gitkeep
-!requirements.txt
+output/*
+!output/.gitkeep

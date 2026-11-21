@@ -1,4 +1,7 @@
-// Build only known document elements. Lecture text and raw HTML always stay text.
+// Minimal Markdown renderer for the notes preview.
+// It builds only known elements with textContent, so generated text and any raw HTML
+// in it always stay text (no innerHTML, no XSS). Supports headings, lists, quotes,
+// code, rules, bold, italics and http(s) links.
 function renderMarkdown(source) {
   function element(tag, text) {
     const node = document.createElement(tag);
@@ -15,7 +18,9 @@ function renderMarkdown(source) {
       if (token.startsWith('[')) {
         const split = token.indexOf('](');
         const anchor = element('a', token.slice(1, split));
-        anchor.href = token.slice(split + 2, -1);
+        anchor.href = token.slice(split + 2, -1);  // The pattern only admits http(s) URLs.
+        anchor.target = '_blank';
+        anchor.rel = 'noopener noreferrer';
         node.append(anchor);
       } else if (token.startsWith('`')) {
         node.append(element('code', token.slice(1, -1)));

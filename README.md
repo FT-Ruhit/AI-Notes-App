@@ -1,79 +1,132 @@
 # AI Notes
 
-Turn a lecture recording into downloadable Markdown study notes. Faster Whisper transcribes the audio locally. Anthropic receives the transcript and optional lecture context and produces a summary, key points in lecture order, and action items when applicable.
+Turn a lecture recording into Markdown study notes. [faster-whisper](https://github.com/SYSTRAN/faster-whisper) transcribes the audio on your machine. Only the transcript and your optional lecture context are sent to Anthropic, which writes a summary, key points in lecture order, and action items.
+
+## Project layout
+
+| Path | What it does |
+| --- | --- |
+| [`api.py`](api.py) | Web server (FastAPI): routes, security middleware, background jobs. Start reading here. |
+| [`transcription.py`](transcription.py) | Decodes audio with PyAV and transcribes it with faster-whisper. |
+| [`notes.py`](notes.py) | Builds the Anthropic prompt and reads the Markdown notes from the response. |
+| [`config.py`](config.py) | Every setting and limit, read from the environment or `.env`. |
+| [`cli.py`](cli.py) | Command-line version: reads from `input/`, writes to `output/`. |
+| [`frontend/`](frontend) | The browser studio: `index.html`, `studio.js` (upload and progress), `markdown.js` (safe Markdown preview), `studio.css`. |
+| [`tests/`](tests) | Offline tests with generated audio and mocked models. |
+
+How a recording flows through the app:
+
+```
+browser ──POST /jobs──▶ api.py ──▶ transcription.py (Whisper, local) ──▶ notes.py (Anthropic) ──▶ Markdown
+   ▲                       │
+   └──GET /jobs/{id}───────┘  progress, live transcript, then GET /jobs/{id}/notes
+```
 
 ## Setup
 
-Use Python 3.12 or newer. From the repository root, create a virtual environment and install the dependencies. In Windows PowerShell, run
+Use Python 3.12 or newer. In Windows PowerShell, run
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
+Copy-Item .env.example .env
 ```
 
-On macOS or Linux, use `python3 -m venv .venv` and `source .venv/bin/activate` before the install command.
+On macOS or Linux, use `python3 -m venv .venv`, `source .venv/bin/activate` and `cp .env.example .env`.
 
-Create a `.env` file alongside `api.py` with your Anthropic API key. Restart the server after changing settings.
+Put your Anthropic API key in `.env`. The file is ignored by git. Restart the server after changing any setting.
 
-```dotenv
-ANTHROPIC_API_KEY=your_anthropic_api_key_here
-```
-
-The default transcription model is `medium`. Its first use may download model files. On a Windows NVIDIA setup, install the CUDA runtime libraries below if they are missing. To use CPU transcription, set `WHISPER_DEVICE=cpu` in `.env`.
+The first transcription downloads the Whisper model. Transcription uses an NVIDIA GPU when one is detected. On Windows, install the CUDA runtime libraries if they are missing:
 
 ```powershell
 python -m pip install nvidia-cublas-cu12==12.9.2.10 nvidia-cudnn-cu12==9.28.1.4 nvidia-cuda-nvrtc-cu12==12.9.86
 ```
 
-## Run the API
+To force CPU transcription, set `WHISPER_DEVICE=cpu`.
+
+## Run the web studio
 
 ```powershell
 python -m uvicorn api:app --host 127.0.0.1 --port 8000
 ```
 
-Open [the upload page](http://127.0.0.1:8000/) for long recordings. After the upload finishes, the page shows the transcription as Whisper recognizes speech, then offers a Markdown download when notes are ready. Pause or resume updates, refresh the page, or reopen its job URL while the server is running. Finished jobs remain available for one hour. Restarting the server clears jobs. Run one server worker for this workflow.
+Open http://127.0.0.1:8000/, choose a recording and a transcription model, and select **Generate notes**. The page shows the transcript as Whisper recognizes speech, then shows the notes with copy and download buttons. You can pause updates, stop the job, or refresh the page. The job id in the URL reconnects to the same job.
 
-The studio lets students select a transcription model, review formatted study notes, and copy or download the original Markdown. It gets the available faster-whisper models and the configured default from `GET /models`. The server keeps the most recently used transcription model in memory.
+Finished jobs stay available for one hour. Restarting the server clears all jobs. Run **one** Uvicorn worker. Jobs and the loaded Whisper model live in that process's memory.
 
-For API clients, multipart `POST /jobs` accepts `file`, optional `context`, and an optional `model` from `GET /models`. Omitting the model uses `WHISPER_MODEL`. A successful upload returns HTTP 202 with an `id`. Poll `GET /jobs/{id}?after=0` for the recording name, model, stage, and transcript segments. Pass the returned `cursor` as the next `after` value to receive new segments. When the stage is `ready`, download `GET /jobs/{id}/notes`. A `failed` stage includes an error message.
+## Security
 
-The [interactive API docs](http://127.0.0.1:8000/docs) also expose the original synchronous `POST /notes` endpoint. Its required `file` field accepts a recording. The optional `context` field accepts text such as a course code, lecture topic, or names the speaker uses.
+The server has **no login**. It is built for one person on their own computer.
+
+- Keep `--host 127.0.0.1`. The server only answers requests addressed to `127.0.0.1`, `localhost` or `[::1]`, which blocks DNS-rebinding attacks.
+- Browsers cannot submit uploads or stop jobs from another site (cross-site request forgery). The server rejects state-changing requests whose `Origin` is not the server itself.
+- Pages get a strict Content Security Policy and cannot be framed. The notes preview builds DOM nodes from text and never inserts generated HTML.
+- A job id is a random UUID and works like a password for that job's transcript, notes and stop button until the job expires.
+- Uploads are limited in size, duration, number of fields, and concurrency. FFmpeg may only read the uploaded bytes and cannot follow references to other files or URLs.
+- Lecture context and transcripts are XML-escaped in the prompt and the model is told to ignore instructions inside them.
+
+Don't expose the server to a network as it is. To share it, put it behind a reverse proxy that adds authentication and HTTPS, and add your hostname to `LOCAL_HOSTS` in `api.py`.
+
+## HTTP API
+
+| Route | Purpose |
+| --- | --- |
+| `GET /models` | Transcription models the server accepts, and the default. |
+| `POST /jobs` | Multipart upload with `file`, optional `context` (up to 4,000 characters), and optional `model`. Returns HTTP 202 with `{"id": ...}`. |
+| `GET /jobs/{id}?after=0` | Stage (`queued`, `transcribing`, `generating`, `ready`, `failed`, `stopping`, `stopped`), new transcript segments, and a `cursor`. Pass the cursor as the next `after` to receive only new segments. |
+| `POST /jobs/{id}/stop` | Stop a queued or running job. |
+| `GET /jobs/{id}/notes` | The finished Markdown, once the stage is `ready`. |
+| `POST /notes` | One-shot: upload `file` and optional `context`, and the response is the Markdown. The request stays open until the notes are done. |
+
+Interactive docs are at http://127.0.0.1:8000/docs. A one-shot example:
 
 ```powershell
 curl.exe --fail -F "file=@input/lecture.m4a" -F "context=Physics, electric dipoles" -o lecture.md http://127.0.0.1:8000/notes
 ```
 
-Use `curl` in place of `curl.exe` on macOS or Linux. A successful request returns the UTF-8 Markdown bytes with a `text/markdown` content type and the recording's base name in the attachment header. The command above saves them to `lecture.md`. The request stays open through transcription and note generation.
+Use `curl` instead of `curl.exe` on macOS or Linux.
 
-Audio is identified from its contents. Supported examples include WAV, MP3, AAC, M4A, Ogg/Opus, WebM, and video files with an audio track. The API releases the upload after transcription and returns the notes directly. Each server process loads Whisper on its first valid recording and reuses that model and one Anthropic client for subsequent requests. Use one Uvicorn worker to share a single GPU model. The next transcription can start while the previous lecture's notes are being generated.
+Audio is identified from its contents. WAV, MP3, AAC, M4A, Ogg/Opus, WebM, and video files with an audio track all work. Up to four recordings are processed at once across both upload routes, and up to 64 jobs are kept. Only one transcription runs at a time, but the next recording can be transcribed while notes for the previous one are being written.
 
 | HTTP status | Meaning |
 | --- | --- |
-| 413 | The multipart request or decoded recording exceeds the configured limit. |
-| 415 | The recording has no decodable audio track. |
-| 422 | The file field is missing, the recording is empty, or Whisper detected no speech. |
-| 502 | Anthropic failed to generate notes. Check the server key and model access. |
-| 503 | The server needs an API key or its transcription backend is unavailable. |
-| 504 | The note provider timed out. |
+| 403 | The request came from another website. |
+| 413 | The upload or the decoded recording exceeds the configured limit. |
+| 415 | The file is not multipart form data, or has no decodable audio track. |
+| 422 | The file is missing or empty, the model is not offered, or Whisper detected no speech. |
+| 429 | The recording queue or the job store is full. Try again later. |
+| 502 | Anthropic failed to generate notes. Check the key and model access. |
+| 503 | The API key is missing or the transcription backend is unavailable. |
+| 504 | Anthropic timed out. |
 
-## Optional configuration
+Notes end with a warning if Anthropic reaches the 15,000-token output limit.
+
+## Configuration
+
+Set these in `.env`. See [`.env.example`](.env.example).
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `ANTHROPIC_MODEL` | `claude-sonnet-5-5` | Choose a notes model available to your Anthropic account. |
-| `WHISPER_MODEL` | `medium` | Choose a Whisper model size or local model directory. |
-| `WHISPER_DEVICE` | `auto` | Select CUDA when detected or CPU otherwise. Set `cpu` or `cuda` to choose explicitly. |
-| `WHISPER_LANGUAGE` | `en` | Set the spoken language code, such as `bn` for Bengali. |
-| `MAX_UPLOAD_MIB` | `256` | Maximum size of the entire HTTP request, in MiB. |
-| `MAX_AUDIO_MINUTES` | `240` | Maximum decoded recording duration for an upload, in minutes. |
+| `ANTHROPIC_API_KEY` | (none) | Required for note generation. |
+| `ANTHROPIC_MODEL` | `claude-sonnet-5-5` | A notes model available to your Anthropic account. |
+| `WHISPER_MODEL` | `medium` | Default Whisper model size or a local model directory. |
+| `WHISPER_DEVICE` | `auto` | `auto` uses CUDA when detected. Set `cpu` or `cuda` to choose. |
+| `WHISPER_LANGUAGE` | `en` | Spoken language code, such as `bn` for Bengali. |
+| `MAX_UPLOAD_MIB` | `256` | Maximum size of an upload request, in MiB. |
+| `MAX_AUDIO_MINUTES` | `240` | Maximum recording length, in minutes. |
 
-## Run the CLI
+Fixed limits, such as concurrency and job retention, are at the bottom of [`config.py`](config.py).
 
-Place a recording in `input/` and run `python main.py`. Select the recording and enter any lecture context. For `lecture.m4a`, the CLI writes `output/lecture.txt` before requesting notes, so the transcript is available even if note generation fails. A successful run also writes `output/lecture.md`. Files with the same base name overwrite the corresponding outputs.
+## Command line
 
-Both entry points mark the Markdown as incomplete if the provider reaches the 15,000-token output limit.
+Put a recording in `input/` and run `python cli.py`. Pick the recording and type any lecture context. For `lecture.m4a`, the CLI writes `output/lecture.txt` first, so the transcript is kept even if note generation fails, and then `output/lecture.md`. Existing files with the same name are overwritten.
 
 ## Tests
 
-Run `python -m unittest discover -s tests -v`. The tests use generated audio and stand-ins for the models and run offline.
+```powershell
+python -m pip install -r requirements-dev.txt
+python -m unittest discover -s tests -v
+```
+
+The tests run offline with generated audio and stand-ins for Whisper and Anthropic.

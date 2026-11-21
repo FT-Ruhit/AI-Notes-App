@@ -17,7 +17,8 @@ from urllib.parse import quote
 from fastapi.testclient import TestClient
 
 import api
-import main
+import cli
+import config
 
 
 def wav_bytes(seconds=1):
@@ -43,7 +44,7 @@ class NotesAPITests(unittest.TestCase):
             usage=SimpleNamespace(input_tokens=10, output_tokens=8),
         )
         self.create_message.return_value = self.message
-        self.client = self.enterContext(TestClient(api.app))
+        self.client = self.enterContext(TestClient(api.app, base_url="http://localhost"))
 
     def upload(self, filename="lecture.wav", content=None, context=""):
         return self.client.post(
@@ -186,6 +187,59 @@ class NotesAPITests(unittest.TestCase):
         self.assertEqual(queued.status_code, 202)
         self.assertEqual(self.client.get("/jobs/" + queued.json()["id"]).json()["model"], api.WHISPER_MODEL)
 
+    def test_local_browser_access_policy(self):
+        self.assertEqual(self.client.get("/models", headers={"host": "example.org"}).status_code, 400)
+        for headers in ({"origin": "https://example.org"}, {"origin": "null"},
+                        {"origin": "http://localhost:4000"}, {"sec-fetch-site": "cross-site"}):
+            self.assertEqual(self.client.post("/jobs", headers=headers).status_code, 403)
+        self.assertEqual(self.client.post("/jobs", headers={"origin": "http://localhost"}).status_code, 422)
+        page = self.client.get("/")
+        self.assertIn("frame-ancestors 'none'", page.headers["content-security-policy"])
+        self.assertEqual(page.headers["referrer-policy"], "no-referrer")
+
+    def test_full_queue_allows_poll_and_stop_and_releases_capacity(self):
+        active = Event()
+
+        async def wait_for_stop(**kwargs):
+            active.set()
+            await asyncio.sleep(10)
+            return self.message
+
+        self.create_message.side_effect = wait_for_stop
+        urls = []
+        try:
+            for _ in range(api.MAX_ACTIVE_RECORDINGS):
+                urls.append(self.start_job())
+            self.assertTrue(active.wait(3))
+            for path in ("/notes", "/jobs"):
+                self.assertEqual(self.client.post(path).status_code, 429)
+            self.assertEqual(self.client.get(urls[0]).status_code, 200)
+            self.client.post(urls[0] + "/stop")
+            self.wait_for_stage(urls[0], "stopped")
+            self.assertEqual(self.client.post("/jobs").status_code, 422)
+        finally:
+            for url in urls:
+                self.client.post(url + "/stop")
+
+    def test_job_retention_and_context_limits(self):
+        with patch.object(api, "MAX_RETAINED_JOBS", 1):
+            job = self.start_job()
+            self.wait_for_stage(job, "ready")
+            files = {"file": ("lecture.wav", wav_bytes())}
+            self.assertEqual(self.client.post("/jobs", files=files).status_code, 429)
+            self.assertEqual(self.client.get(job + "/notes").status_code, 200)
+        self.assertEqual(self.upload(context="a" * 4001).status_code, 422)
+        prompt = api.build_note_request("x < y", "A & B")["messages"][0]["content"]
+        self.assertIn("x &lt; y", prompt)
+        self.assertIn("A &amp; B", prompt)
+
+    def test_recording_routes_limit_multipart_before_inference(self):
+        for path in ("/jobs", "/notes"):
+            files = [("file", ("first.wav", wav_bytes())), ("file", ("second.wav", wav_bytes()))]
+            self.assertEqual(self.client.post(path, files=files).status_code, 400)
+            self.assertEqual(self.client.post(path, data={"context": "Physics"}).status_code, 415)
+        self.whisper.assert_not_called()
+
     def test_studio_assets_are_served(self):
         page = self.client.get("/")
         for name in ("studio.css", "studio.js", "markdown.js"):
@@ -193,9 +247,33 @@ class NotesAPITests(unittest.TestCase):
             self.assertIn(path, page.text)
             self.assertEqual(self.client.get(path).status_code, 200)
 
+    def test_security_headers_on_every_response(self):
+        for path in ("/", "/models", "/frontend/studio.js", "/jobs/unknown"):
+            headers = self.client.get(path).headers
+            self.assertEqual(headers["content-security-policy"], api.STRICT_CSP)
+            self.assertEqual(headers["x-content-type-options"], "nosniff")
+            self.assertEqual(headers["x-frame-options"], "DENY")
+        self.assertEqual(self.client.get("/docs").headers["content-security-policy"], api.DOCS_CSP)
+
+    def test_shutdown_stops_running_jobs(self):
+        started = Event()
+
+        async def generate(**kwargs):
+            started.set()
+            await asyncio.sleep(30)
+            return self.message
+
+        self.create_message.side_effect = generate
+        with TestClient(api.app, base_url="http://localhost") as client:
+            response = client.post("/jobs", files={"file": ("lecture.wav", wav_bytes())})
+            self.assertEqual(response.status_code, 202)
+            self.assertTrue(started.wait(3))
+            began = monotonic()
+        self.assertLess(monotonic() - began, 5)
+
     def test_unicode_filename_uses_only_the_basename(self):
         name = "পাঠ"
-        header = api.download_header(f"C:\\recordings\\{name}.aac")
+        header = api.attachment_header(f"C:\\recordings\\{name}.aac")
         self.assertIn("filename*=UTF-8''" + quote(name + ".md"), header)
         self.assertNotIn("recordings", header)
 
@@ -240,7 +318,7 @@ class NotesAPITests(unittest.TestCase):
         self.assertNotIn("content-disposition", response.headers)
 
     def test_missing_api_key_skips_transcription(self):
-        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": ""}), TestClient(api.app) as client:
+        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": ""}), TestClient(api.app, base_url="http://localhost") as client:
             response = client.post("/notes", files={"file": ("lecture.wav", wav_bytes())})
         self.assertEqual(response.status_code, 503)
         self.whisper.assert_not_called()
@@ -276,15 +354,25 @@ class CLITests(unittest.TestCase):
             folder.mkdir()
             (folder / "lecture.WAV").write_bytes(wav_bytes())
             (folder / "unreadable.mp3").write_text("not audio", encoding="utf-8")
-            self.assertEqual(main.find_recordings(folder), [folder / "lecture.WAV"])
+            self.assertEqual(cli.find_recordings(folder), [folder / "lecture.WAV"])
             with (
-                patch("main.Transcriber") as transcriber,
-                patch("main.make_notes", side_effect=RuntimeError("offline")),
+                patch("cli.Transcriber") as transcriber,
+                patch("cli.make_notes", side_effect=RuntimeError("offline")),
                 patch("builtins.input", side_effect=["0", "Physics"]),
                 redirect_stdout(io.StringIO()),
             ):
                 transcriber.return_value.transcribe.return_value = "Charge"
                 with self.assertRaisesRegex(RuntimeError, "offline"):
-                    main.main()
+                    cli.main()
             self.assertEqual(Path("output/lecture.txt").read_text(encoding="utf-8"), "Charge")
             self.assertFalse(Path("output/lecture.md").exists())
+
+
+class ConfigTests(unittest.TestCase):
+    def test_limits_must_be_positive_whole_numbers(self):
+        for value in ("0", "-5", "ten"):
+            with patch.dict(os.environ, {"AI_NOTES_TEST_LIMIT": value}), self.assertRaises(ValueError):
+                config._positive_int("AI_NOTES_TEST_LIMIT", 1)
+        with patch.dict(os.environ, {"AI_NOTES_TEST_LIMIT": "12"}):
+            self.assertEqual(config._positive_int("AI_NOTES_TEST_LIMIT", 1), 12)
+        self.assertEqual(config._positive_int("AI_NOTES_UNSET_LIMIT", 7), 7)
